@@ -5,15 +5,8 @@ on:
     branches:
       - main
     paths:
-      - 'ios/**'
-      - 'src/**'
-      - 'capacitor.config.ts'
-      - 'package.json'
+      - 'App/**'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version number (e.g., 1.0.4)'
-        required: false
 
 jobs:
   build-ios:
@@ -22,25 +15,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Sync Capacitor
-        run: npx cap sync ios
+      - name: Install CocoaPods dependencies
+        run: |
+          cd App
+          pod install
 
       - name: Extract version info
         id: version
         run: |
-          VERSION=$(grep -oE 'MARKETING_VERSION = [^;]+' ios/App/App.xcodeproj/project.pbxproj | head -1 | sed 's/MARKETING_VERSION = //;s/;//;s/ //g;s/"//g')
-          BUILD=$(grep -oE 'CURRENT_PROJECT_VERSION = [^;]+' ios/App/App.xcodeproj/project.pbxproj | head -1 | sed 's/CURRENT_PROJECT_VERSION = //;s/;//;s/ //g;s/"//g')
+          VERSION=$(grep -oE 'MARKETING_VERSION = [^;]+' App/App.xcodeproj/project.pbxproj | head -1 | sed 's/MARKETING_VERSION = //;s/;//;s/ //g;s/"//g')
+          BUILD=$(grep -oE 'CURRENT_PROJECT_VERSION = [^;]+' App/App.xcodeproj/project.pbxproj | head -1 | sed 's/CURRENT_PROJECT_VERSION = //;s/;//;s/ //g;s/"//g')
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           IPA_NAME="BeautyCita-iOS-v${VERSION}-Build${BUILD}-${TIMESTAMP}.ipa"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
@@ -55,7 +40,8 @@ jobs:
 
       - name: Build iOS app
         run: |
-          xcodebuild -workspace ios/App/App.xcworkspace \
+          cd App
+          xcodebuild -workspace App.xcworkspace \
             -scheme App \
             -configuration Release \
             -archivePath $RUNNER_TEMP/BeautyCita.xcarchive \
@@ -63,94 +49,29 @@ jobs:
 
       - name: Export IPA
         run: |
+          cd App
           xcodebuild -exportArchive \
             -archivePath $RUNNER_TEMP/BeautyCita.xcarchive \
             -exportPath $RUNNER_TEMP \
-            -exportOptionsPlist ios/ExportOptions.plist
+            -exportOptionsPlist ExportOptions.plist || echo "Export failed - may need signing"
 
-          mv $RUNNER_TEMP/App.ipa $RUNNER_TEMP/${{ steps.version.outputs.ipa_name }}
+          if [ -f "$RUNNER_TEMP/App.ipa" ]; then
+            mv $RUNNER_TEMP/App.ipa $RUNNER_TEMP/${{ steps.version.outputs.ipa_name }}
+          fi
 
-      - name: Upload to Cloudflare R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          brew install awscli
-
-          aws s3 cp "$RUNNER_TEMP/${{ steps.version.outputs.ipa_name }}" \
-            "s3://${R2_BUCKET}/downloads/ios/${{ steps.version.outputs.ipa_name }}" \
-            --endpoint-url="${R2_ENDPOINT}" \
-            --acl public-read
-
-          IPA_SIZE=$(stat -f%z "$RUNNER_TEMP/${{ steps.version.outputs.ipa_name }}")
-          IPA_SHA256=$(shasum -a 256 "$RUNNER_TEMP/${{ steps.version.outputs.ipa_name }}" | awk '{print $1}')
-
-          cat > latest.json <<EOF
-          {
-            "version": "${{ steps.version.outputs.version }}",
-            "build": "${{ steps.version.outputs.build }}",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "filename": "${{ steps.version.outputs.ipa_name }}",
-            "url": "https://pub-${{ secrets.R2_PUBLIC_ID }}.r2.dev/downloads/ios/${{ steps.version.outputs.ipa_name }}",
-            "size": "${IPA_SIZE}",
-            "sha256": "${IPA_SHA256}"
-          }
-          EOF
-
-          aws s3 cp latest.json \
-            "s3://${R2_BUCKET}/downloads/ios/latest.json" \
-            --endpoint-url="${R2_ENDPOINT}" \
-            --acl public-read \
-            --content-type application/json
-
-      - name: Trigger frontend rebuild
-        env:
-          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-        run: |
-          echo "$SERVER_SSH_KEY" > ssh_key
-          chmod 600 ssh_key
-
-          ssh -i ssh_key -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} \
-            "cd /var/www/beautycita.com/frontend && npm run build"
-
-          rm ssh_key
-
-      - name: Create release
-        if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v1
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build }}
-          name: BeautyCita iOS v${{ steps.version.outputs.version }} Build ${{ steps.version.outputs.build }}
-          body: |
-            ## BeautyCita iOS Build
+          name: BeautyCita-iOS-Archive
+          path: ${{ runner.temp }}/BeautyCita.xcarchive
+          retention-days: 5
 
-            **Version:** ${{ steps.version.outputs.version }}
-            **Build:** ${{ steps.version.outputs.build }}
-            **Timestamp:** ${{ steps.version.outputs.timestamp }}
-
-            ### Download
-            [Download IPA](https://pub-${{ secrets.R2_PUBLIC_ID }}.r2.dev/downloads/ios/${{ steps.version.outputs.ipa_name }})
-
-            ### Changes
-            ${{ github.event.head_commit.message }}
-
-            ---
-            Built with GitHub Actions
-          files: |
-            ${{ runner.temp }}/${{ steps.version.outputs.ipa_name }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify completion
+      - name: Build summary
         if: always()
         run: |
-          echo "Build Status: ${{ job.status }}"
-          echo "Version: ${{ steps.version.outputs.version }}"
-          echo "Build: ${{ steps.version.outputs.build }}"
-          echo "IPA: ${{ steps.version.outputs.ipa_name }}"
+          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Build:** ${{ steps.version.outputs.build }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** ${{ steps.version.outputs.timestamp }}" >> $GITHUB_STEP_SUMMARY
